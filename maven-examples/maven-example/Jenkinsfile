@@ -1,0 +1,158 @@
+pipeline {
+    agent any
+    tools {
+        jfrog 'jfrog-cli-latest'
+        maven 'maven'
+    }
+    environment {
+            PROJECT_WORKING_DIR = 'examples/jenkins-provenance'
+            PACKAGE_REPO_NAME = 'maven-libs-release-local'
+            MARKDOWN_FILE_NAME = 'JenkinsSLSA.md'
+            PREDICATE_FILE_NAME = '${PROJECT_WORKING_DIR}/decoded-payload.json'
+            PREDICATE_TYPE = 'http://slsa.dev/provenance/v1'
+    }
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'jenkins-provenance', url: 'https://github.com/jfrog/Evidence-Examples.git', credentialsId: 'github'
+            }
+        }
+
+        stage('Build and Publish') {
+            steps {
+                script {
+                        jf 'mvn-config \
+                                --repo-resolve-releases=maven-libs-release \
+                                --repo-resolve-snapshots=maven-libs-snapshot \
+                                --repo-deploy-releases=maven-libs-release \
+                                --repo-deploy-snapshots=maven-libs-snapshot'
+                         jf 'mvn clean install -f ${PROJECT_WORKING_DIR}/pom.xml'
+                         
+                         // Get the parent project information
+                         env.PARENT_PACKAGE_NAME = sh(script: "mvn help:evaluate -f ${PROJECT_WORKING_DIR}/pom.xml -Dexpression=project.artifactId -q -DforceStdout", returnStdout: true).trim()
+                         env.PARENT_PACKAGE_VERSION = sh(script: "mvn help:evaluate -f ${PROJECT_WORKING_DIR}/pom.xml -Dexpression=project.version -q -DforceStdout", returnStdout: true).trim()
+                         
+                         // Detect modules dynamically
+                         def modules = detectModules()
+                         echo "Detected modules: ${modules}"
+                         
+                         // Get all modules and their artifacts
+                         env.MODULE_ARTIFACTS = ''
+                         
+                         for (module in modules) {
+                             try {
+                                 def artifactId = sh(script: "mvn help:evaluate -f ${PROJECT_WORKING_DIR}/${module}/pom.xml -Dexpression=project.artifactId -q -DforceStdout", returnStdout: true).trim()
+                                 def version = sh(script: "mvn help:evaluate -f ${PROJECT_WORKING_DIR}/${module}/pom.xml -Dexpression=project.version -q -DforceStdout", returnStdout: true).trim()
+                                 def packaging = sh(script: "mvn help:evaluate -f ${PROJECT_WORKING_DIR}/${module}/pom.xml -Dexpression=project.packaging -q -DforceStdout", returnStdout: true).trim()
+                                 
+                                 env.MODULE_ARTIFACTS += "${artifactId}:${version}:${packaging},"
+                                 echo "Module ${module}: ${artifactId}:${version}:${packaging}"
+                             } catch (Exception e) {
+                                 echo "Error processing module ${module}: ${e.getMessage()}"
+                             }
+                         }
+                         
+                         // Remove trailing comma
+                         env.MODULE_ARTIFACTS = env.MODULE_ARTIFACTS.replaceAll(/,$/, '')
+                         
+                         // Keep original single artifact variables for backward compatibility
+                         env.PACKAGE_NAME = env.PARENT_PACKAGE_NAME
+                         env.PACKAGE_VERSION = env.PARENT_PACKAGE_VERSION
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            // Record provenance for all artifacts from all modules
+            provenanceRecorder artifactFilter: '${PROJECT_WORKING_DIR}/**/target/*.{jar,war}', targetDirectory: '${PROJECT_WORKING_DIR}/build/slsa'
+            script {
+                def slsaDir = '${PROJECT_WORKING_DIR}/build/slsa'
+                def jsonlFiles = sh(script: "ls ${slsaDir}/*.jsonl 2>/dev/null || true", returnStdout: true).trim().split("\\r?\\n")
+                def jsonlFile = jsonlFiles.find { it }
+                if (!jsonlFile) {
+                    echo "No .jsonl file found in ${slsaDir}/"
+                    return
+                }
+                echo "Found JSONL file: ${jsonlFile}"
+                def jsonlText = readFile(jsonlFile)
+                def jsonlMap = new groovy.json.JsonSlurperClassic().parseText(jsonlText)
+                def decodedPayload = new String(jsonlMap.decodedPayload.decodeBase64(), 'UTF-8')
+                def prettyJson = groovy.json.JsonOutput.prettyPrint(decodedPayload)
+                writeFile file: "${PROJECT_WORKING_DIR}/decoded-payload.json", text: prettyJson
+                echo "Decoded payload saved to examples/jenkins-provenance/decoded-payload.json"
+                sh 'python3 ${PROJECT_WORKING_DIR}/json-to-md.py'
+            }
+            
+            // Create evidence for each module artifact
+            withCredentials([
+                file(credentialsId: 'PRIVATE_PEM', variable: 'PRIVATE_PEM'),
+                string(credentialsId: 'KEY_ALIAS', variable: 'KEY_ALIAS')
+            ]) {
+                script {
+                    def artifacts = env.MODULE_ARTIFACTS.split(',')
+                    for (artifact in artifacts) {
+                        if (artifact.trim()) {
+                            def parts = artifact.split(':')
+                            if (parts.length >= 3) {
+                                def artifactId = parts[0].trim()
+                                def version = parts[1].trim()
+                                def packaging = parts[2].trim()
+                                
+                                echo "Creating evidence for ${artifactId}:${version}:${packaging}"
+                                
+                                jf 'evd create \
+                                    --package-name ' + artifactId + ' \
+                                    --package-version ' + version + ' \
+                                    --package-repo-name ${PACKAGE_REPO_NAME} \
+                                    --key ${PRIVATE_PEM} \
+                                    --key-alias ${KEY_ALIAS} \
+                                    --predicate ${PREDICATE_FILE_NAME} \
+                                    --predicate-type ${PREDICATE_TYPE} \
+                                    --markdown ' + artifactId + '-${MARKDOWN_FILE_NAME}'
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Helper function to detect Maven modules
+def detectModules() {
+    def modules = []
+    
+    // Try to get modules using Maven expression
+    def modulesOutput = sh(script: "mvn help:evaluate -f ${PROJECT_WORKING_DIR}/pom.xml -Dexpression=project.modules -q -DforceStdout", returnStdout: true).trim()
+    
+    if (modulesOutput && modulesOutput != '[]' && modulesOutput != 'null') {
+        // Parse XML-like output from Maven
+        def lines = modulesOutput.split('\n')
+        for (line in lines) {
+            def moduleMatch = line =~ /<module>(.*?)<\/module>/
+            if (moduleMatch.find()) {
+                modules.add(moduleMatch.group(1))
+            }
+        }
+    }
+    
+    // If no modules found, check if this is a multi-module project
+    if (modules.isEmpty()) {
+        def packaging = sh(script: "mvn help:evaluate -f ${PROJECT_WORKING_DIR}/pom.xml -Dexpression=project.packaging -q -DforceStdout", returnStdout: true).trim()
+        if (packaging == 'pom') {
+            // This is a parent project, look for subdirectories with pom.xml files
+            def dirs = sh(script: "find ${PROJECT_WORKING_DIR} -maxdepth 1 -type d -exec test -f {}/pom.xml \\; -print", returnStdout: true).trim()
+            if (dirs) {
+                dirs.split('\n').each { dir ->
+                    if (dir.trim()) {
+                        modules.add(dir.trim().replace("${PROJECT_WORKING_DIR}/", ''))
+                    }
+                }
+            }
+        }
+    }
+    
+    return modules
+}
